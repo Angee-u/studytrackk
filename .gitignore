@@ -1,0 +1,17 @@
+# Ambiente virtual Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Variáveis de ambiente (NUNCA versionar segredos)
+.env
+.env.local
+.env*.local
+
+# Vercel
+.vercel
+
+# Editor
+.vscode/
+.idea/
