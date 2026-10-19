@@ -10,7 +10,7 @@ studytrack-backend/
 │   └── index.py
 ├── public/
 │   ├── notificacoes.html
-│   └── styles.css          ← NOVO
+│   └── styles.css
 ├── requirements.txt
 └── README.md
 ```
