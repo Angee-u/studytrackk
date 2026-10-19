@@ -1,135 +1,64 @@
+
 <!doctype html>
 <html lang="pt-br">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>studyTrack — Disparar notificação</title>
-<style>
-  :root {
-    --bg: #0f1115;
-    --card: #171a21;
-    --border: #2a2e37;
-    --text: #e8e9ec;
-    --muted: #9aa0ab;
-    --accent: #3f51b5;
-    --accent-hover: #4c5fd1;
-    --ok: #2e7d32;
-    --erro: #c62828;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    display: flex;
-    justify-content: center;
-    padding: 24px 16px;
-  }
-  main { width: 100%; max-width: 560px; }
-  h1 { font-size: 1.3rem; margin-bottom: 4px; }
-  p.sub { color: var(--muted); margin-top: 0; margin-bottom: 24px; font-size: 0.9rem; }
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px;
-    margin-bottom: 16px;
-  }
-  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; margin-top: 14px; }
-  label:first-child { margin-top: 0; }
-  input[type="text"], textarea, select {
-    width: 100%;
-    background: #0f1115;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--text);
-    padding: 10px 12px;
-    font-size: 0.95rem;
-    font-family: inherit;
-  }
-  textarea { resize: vertical; min-height: 70px; }
-  select[multiple] { min-height: 140px; }
-  .ajuda { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
-  button {
-    margin-top: 18px;
-    width: 100%;
-    background: var(--accent);
-    color: white;
-    border: none;
-    border-radius: 8px;
-    padding: 12px;
-    font-size: 0.95rem;
-    font-weight: 600;
-    cursor: pointer;
-  }
-  button:hover { background: var(--accent-hover); }
-  button:disabled { opacity: 0.5; cursor: default; }
-  .status { margin-top: 14px; font-size: 0.88rem; white-space: pre-wrap; }
-  .status.ok { color: #81c784; }
-  .status.erro { color: #ef9a9a; }
-  .lista-usuarios { max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
-  .usuario-item {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 9px 12px;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.9rem;
-  }
-  .usuario-item:last-child { border-bottom: none; }
-  .usuario-item input { width: auto; }
-  .usuario-nome { font-weight: 500; }
-  .usuario-email { color: var(--muted); font-size: 0.8rem; }
-  .topo-lista {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 8px;
-  }
-  .topo-lista button.link {
-    width: auto;
-    background: none;
-    color: var(--accent-hover);
-    padding: 0;
-    margin: 0;
-    font-weight: 500;
-    font-size: 0.82rem;
-    text-decoration: underline;
-  }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>studyTrack — Disparar notificação</title>
+  <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
 <main>
   <h1>Disparar notificação — studyTrack</h1>
-  <p class="sub">Ferramenta interna de teste. Envia uma push notification via Firebase para os aparelhos registrados dos usuários selecionados.</p>
+  <p class="sub">
+    Ferramenta interna de teste. Envia notificações via Firebase
+    para os aparelhos registrados dos usuários selecionados.
+  </p>
 
   <div class="card">
     <div class="topo-lista">
-      <label style="margin:0;">Destinatários</label>
-      <button type="button" class="link" id="btnRecarregar">recarregar lista</button>
+      <label class="titulo-lista">Destinatários</label>
+      <button type="button" class="link" id="btnRecarregar">
+        Recarregar lista
+      </button>
     </div>
+
     <div id="listaUsuarios" class="lista-usuarios">
-      <div class="usuario-item" style="color: var(--muted);">Carregando usuários...</div>
+      <div class="usuario-item mensagem-lista">
+        Carregando usuários...
+      </div>
     </div>
-    <p class="ajuda">Só usuários com pelo menos um aparelho registrado (via <code>/api/dispositivos</code>) de fato recebem a notificação.</p>
+
+    <p class="ajuda">
+      Somente usuários com aparelho registrado via
+      <code>/api/dispositivos</code> recebem a notificação.
+    </p>
   </div>
 
   <div class="card">
     <label for="titulo">Título</label>
-    <input type="text" id="titulo" placeholder="Ex.: Prova amanhã" maxlength="100">
+    <input
+      type="text"
+      id="titulo"
+      placeholder="Ex.: Prova amanhã"
+      maxlength="100"
+    >
 
     <label for="corpo">Mensagem</label>
-    <textarea id="corpo" placeholder="Ex.: Sistemas Distribuídos às 19h"></textarea>
+    <textarea
+      id="corpo"
+      placeholder="Ex.: Sistemas Distribuídos às 19h"
+    ></textarea>
 
-    <button id="btnEnviar" type="button">Enviar notificação</button>
+    <button id="btnEnviar" type="button">
+      Enviar notificação
+    </button>
+
     <div id="status" class="status"></div>
   </div>
 </main>
 
 <script>
-  // Mesma origem do backend — se um dia isso for servido em outro domínio,
-  // troca por 'https://studytrackk.vercel.app'
   const API = '';
 
   const elLista = document.getElementById('listaUsuarios');
@@ -139,44 +68,62 @@
   const elBtnEnviar = document.getElementById('btnEnviar');
   const elBtnRecarregar = document.getElementById('btnRecarregar');
 
-  async function carregarUsuarios() {
-    elLista.innerHTML = '<div class="usuario-item" style="color: var(--muted);">Carregando usuários...</div>';
-    try {
-      const resp = await fetch(`${API}/api/usuarios`);
-      const dados = await resp.json();
-      if (!resp.ok) throw new Error(dados.erro || 'Erro ao carregar usuários');
-
-      if (!dados.usuarios || dados.usuarios.length === 0) {
-        elLista.innerHTML = '<div class="usuario-item" style="color: var(--muted);">Nenhum usuário cadastrado ainda.</div>';
-        return;
-      }
-
-      elLista.innerHTML = '';
-      for (const u of dados.usuarios) {
-        const item = document.createElement('label');
-        item.className = 'usuario-item';
-        item.innerHTML = `
-          <input type="checkbox" value="${u.id}" class="chk-usuario">
-          <span>
-            <div class="usuario-nome">${escapeHtml(u.nome)}</div>
-            <div class="usuario-email">${escapeHtml(u.email)} · id ${u.id}</div>
-          </span>
-        `;
-        elLista.appendChild(item);
-      }
-    } catch (e) {
-      elLista.innerHTML = `<div class="usuario-item" style="color: var(--erro);">Falha ao carregar: ${escapeHtml(e.message)}</div>`;
-    }
-  }
-
   function escapeHtml(s) {
     const d = document.createElement('div');
     d.textContent = s ?? '';
     return d.innerHTML;
   }
 
+  async function carregarUsuarios() {
+    elLista.innerHTML =
+      '<div class="usuario-item mensagem-lista">Carregando usuários...</div>';
+
+    try {
+      const resp = await fetch(`${API}/api/usuarios`);
+      const dados = await resp.json();
+
+      if (!resp.ok) {
+        throw new Error(dados.erro || 'Erro ao carregar usuários');
+      }
+
+      if (!dados.usuarios || dados.usuarios.length === 0) {
+        elLista.innerHTML =
+          '<div class="usuario-item mensagem-lista">Nenhum usuário cadastrado ainda.</div>';
+        return;
+      }
+
+      elLista.innerHTML = '';
+
+      for (const u of dados.usuarios) {
+        const item = document.createElement('label');
+        item.className = 'usuario-item';
+
+        item.innerHTML = `
+          <input type="checkbox" value="${u.id}" class="chk-usuario">
+          <span>
+            <div class="usuario-nome">${escapeHtml(u.nome)}</div>
+            <div class="usuario-email">
+              ${escapeHtml(u.email)} · id ${u.id}
+            </div>
+          </span>
+        `;
+
+        elLista.appendChild(item);
+      }
+
+    } catch (e) {
+      elLista.innerHTML = `
+        <div class="usuario-item mensagem-lista erro">
+          Falha ao carregar: ${escapeHtml(e.message)}
+        </div>
+      `;
+    }
+  }
+
   function usuariosSelecionados() {
-    return Array.from(document.querySelectorAll('.chk-usuario:checked')).map(el => parseInt(el.value, 10));
+    return Array.from(
+      document.querySelectorAll('.chk-usuario:checked')
+    ).map(el => parseInt(el.value, 10));
   }
 
   async function enviar() {
@@ -192,6 +139,7 @@
       elStatus.textContent = 'Selecione ao menos um usuário.';
       return;
     }
+
     if (!titulo || !corpo) {
       elStatus.className = 'status erro';
       elStatus.textContent = 'Preencha título e mensagem.';
@@ -200,37 +148,61 @@
 
     elBtnEnviar.disabled = true;
     elBtnEnviar.textContent = 'Enviando...';
-    elStatus.textContent = '';
 
     const resultados = [];
+
     for (const usuario_id of ids) {
       try {
         const resp = await fetch(`${API}/api/notificacoes/enviar`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ usuario_id, titulo, corpo }),
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            usuario_id,
+            titulo,
+            corpo
+          })
         });
+
         const dados = await resp.json();
+
         if (resp.ok) {
-          resultados.push(`usuário ${usuario_id}: ${dados.enviadas} enviada(s)${dados.falhas?.length ? `, falhas: ${dados.falhas.join('; ')}` : ''}`);
+          resultados.push(
+            `usuário ${usuario_id}: ${dados.enviadas} enviada(s)` +
+            (dados.falhas?.length
+              ? `, falhas: ${dados.falhas.join('; ')}`
+              : '')
+          );
         } else {
-          resultados.push(`usuário ${usuario_id}: erro — ${dados.erro}`);
+          resultados.push(
+            `usuário ${usuario_id}: erro — ${dados.erro}`
+          );
         }
+
       } catch (e) {
-        resultados.push(`usuário ${usuario_id}: falha de conexão — ${e.message}`);
+        resultados.push(
+          `usuário ${usuario_id}: falha de conexão — ${e.message}`
+        );
       }
     }
 
     elBtnEnviar.disabled = false;
     elBtnEnviar.textContent = 'Enviar notificação';
 
-    const algumaFalha = resultados.some(r => r.includes('erro') || r.includes('falha'));
-    elStatus.className = 'status ' + (algumaFalha ? 'erro' : 'ok');
+    const algumaFalha = resultados.some(
+      r => r.includes('erro') || r.includes('falha')
+    );
+
+    elStatus.className =
+      'status ' + (algumaFalha ? 'erro' : 'ok');
+
     elStatus.textContent = resultados.join('\n');
   }
 
   elBtnEnviar.addEventListener('click', enviar);
   elBtnRecarregar.addEventListener('click', carregarUsuarios);
+
   carregarUsuarios();
 </script>
 </body>

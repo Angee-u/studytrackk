@@ -1,7 +1,7 @@
 import os
 import json
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 import bcrypt
 from supabase import create_client, Client
 
@@ -11,6 +11,10 @@ app = Flask(__name__)
 # (Project Settings > Environment Variables)
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+@app.route("/", methods=["GET"])
+def pagina_inicial():
+    return redirect("/notificacoes.html")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Defina SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente")

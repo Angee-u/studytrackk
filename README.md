@@ -7,7 +7,10 @@ CRUD inicial da entidade `usuarios`: cadastro (POST) e listagem (GET).
 ```
 studytrack-backend/
 ├── api/
-│   └── index.py     # app Flask — entrypoint que a Vercel detecta
+│   └── index.py
+├── public/
+│   ├── notificacoes.html
+│   └── styles.css          ← NOVO
 ├── requirements.txt
 └── README.md
 ```
