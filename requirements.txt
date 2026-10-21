@@ -3,3 +3,4 @@ supabase==2.31.0
 bcrypt==4.2.0
 google-auth==2.58.1
 requests==2.33.1
+PyJWT==2.13.0

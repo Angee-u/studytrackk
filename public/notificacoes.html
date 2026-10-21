@@ -1,4 +1,3 @@
-
 <!doctype html>
 <html lang="pt-br">
 <head>
@@ -12,198 +11,266 @@
   <h1>Disparar notificação — studyTrack</h1>
   <p class="sub">
     Ferramenta interna de teste. Envia notificações via Firebase
-    para os aparelhos registrados dos usuários selecionados.
+    para os aparelhos registrados na sua conta.
   </p>
 
-  <div class="card">
-    <div class="topo-lista">
-      <label class="titulo-lista">Destinatários</label>
-      <button type="button" class="link" id="btnRecarregar">
-        Recarregar lista
-      </button>
-    </div>
+  <div class="card" id="areaLogin">
+    <h2 class="titulo-card">Acessar conta</h2>
+    <form id="formLogin">
+      <label for="email">E-mail</label>
+      <input
+        type="email"
+        id="email"
+        autocomplete="username"
+        placeholder="Seu e-mail cadastrado"
+        required
+      >
 
-    <div id="listaUsuarios" class="lista-usuarios">
-      <div class="usuario-item mensagem-lista">
-        Carregando usuários...
+      <label for="senha">Senha</label>
+      <input
+        type="password"
+        id="senha"
+        autocomplete="current-password"
+        required
+      >
+
+      <button type="submit" id="btnEntrar">Entrar</button>
+    </form>
+  </div>
+
+  <div id="areaAutenticada" hidden>
+    <div class="card">
+      <div class="topo-lista">
+        <label class="titulo-lista">Destinatário</label>
+        <button type="button" class="link" id="btnRecarregar">
+          Recarregar lista
+        </button>
       </div>
+
+      <div id="listaUsuarios" class="lista-usuarios">
+        <div class="usuario-item mensagem-lista">
+          Carregando usuário...
+        </div>
+      </div>
+
+      <p class="ajuda">
+        Somente aparelhos vinculados à sua conta por
+        <code>/api/dispositivos</code> recebem a notificação.
+      </p>
+
+      <button id="btnSair" class="btn-sair" type="button">Sair da conta</button>
     </div>
 
-    <p class="ajuda">
-      Somente usuários com aparelho registrado via
-      <code>/api/dispositivos</code> recebem a notificação.
-    </p>
+    <div class="card">
+      <form id="formNotificacao">
+        <label for="titulo">Título</label>
+        <input
+          type="text"
+          id="titulo"
+          placeholder="Ex.: Prova amanhã"
+          maxlength="100"
+          required
+        >
+
+        <label for="corpo">Mensagem</label>
+        <textarea
+          id="corpo"
+          placeholder="Ex.: Sistemas Distribuídos às 19h"
+          required
+        ></textarea>
+
+        <button id="btnEnviar" type="submit">Enviar notificação</button>
+      </form>
+    </div>
   </div>
 
-  <div class="card">
-    <label for="titulo">Título</label>
-    <input
-      type="text"
-      id="titulo"
-      placeholder="Ex.: Prova amanhã"
-      maxlength="100"
-    >
-
-    <label for="corpo">Mensagem</label>
-    <textarea
-      id="corpo"
-      placeholder="Ex.: Sistemas Distribuídos às 19h"
-    ></textarea>
-
-    <button id="btnEnviar" type="button">
-      Enviar notificação
-    </button>
-
-    <div id="status" class="status"></div>
-  </div>
+  <div id="status" class="status" role="status" aria-live="polite"></div>
 </main>
 
 <script>
   const API = '';
+  let token = null;
+  let usuario = null;
 
+  const elLogin = document.getElementById('areaLogin');
+  const elAreaAutenticada = document.getElementById('areaAutenticada');
   const elLista = document.getElementById('listaUsuarios');
   const elTitulo = document.getElementById('titulo');
   const elCorpo = document.getElementById('corpo');
   const elStatus = document.getElementById('status');
+  const elBtnEntrar = document.getElementById('btnEntrar');
   const elBtnEnviar = document.getElementById('btnEnviar');
+  const elBtnSair = document.getElementById('btnSair');
   const elBtnRecarregar = document.getElementById('btnRecarregar');
+  const elFormLogin = document.getElementById('formLogin');
+  const elFormNotificacao = document.getElementById('formNotificacao');
 
-  function escapeHtml(s) {
-    const d = document.createElement('div');
-    d.textContent = s ?? '';
-    return d.innerHTML;
+  function mostrarStatus(mensagem, tipo = '') {
+    elStatus.className = tipo ? `status ${tipo}` : 'status';
+    elStatus.textContent = mensagem;
+  }
+
+  function atualizarTela() {
+    const autenticado = Boolean(token && usuario);
+    elLogin.hidden = autenticado;
+    elAreaAutenticada.hidden = !autenticado;
+  }
+
+  function encerrarSessaoLocal() {
+    token = null;
+    usuario = null;
+    elLista.replaceChildren();
+    elFormNotificacao.reset();
+    atualizarTela();
+  }
+
+  async function chamarApi(caminho, opcoes = {}) {
+    const headers = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (opcoes.corpo !== undefined) headers['Content-Type'] = 'application/json';
+
+    const resposta = await fetch(`${API}${caminho}`, {
+      method: opcoes.metodo || 'GET',
+      headers,
+      body: opcoes.corpo !== undefined ? JSON.stringify(opcoes.corpo) : undefined
+    });
+
+    const dados = await resposta.json().catch(() => ({}));
+    if (!resposta.ok) {
+      if (resposta.status === 401 && token) {
+        encerrarSessaoLocal();
+        throw new Error('Sua sessão expirou. Entre novamente.');
+      }
+      throw new Error(dados.erro || `Erro HTTP ${resposta.status}`);
+    }
+    return dados;
   }
 
   async function carregarUsuarios() {
-    elLista.innerHTML =
-      '<div class="usuario-item mensagem-lista">Carregando usuários...</div>';
+    if (!token) return;
+    elLista.textContent = 'Carregando usuário...';
+    elBtnRecarregar.disabled = true;
 
     try {
-      const resp = await fetch(`${API}/api/usuarios`);
-      const dados = await resp.json();
+      // A API JWT só permite consultar a conta que está conectada.
+      const dados = await chamarApi('/api/auth/me');
+      usuario = dados.usuario;
+      if (!usuario) throw new Error('Não foi possível identificar a conta.');
 
-      if (!resp.ok) {
-        throw new Error(dados.erro || 'Erro ao carregar usuários');
+      elLista.replaceChildren();
+      const item = document.createElement('label');
+      item.className = 'usuario-item';
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'chk-usuario';
+      checkbox.value = String(usuario.id);
+      checkbox.checked = true;
+
+      const detalhes = document.createElement('span');
+      const nome = document.createElement('span');
+      nome.className = 'usuario-nome';
+      nome.textContent = usuario.nome;
+
+      const email = document.createElement('span');
+      email.className = 'usuario-email';
+      email.textContent = `${usuario.email} · id ${usuario.id}`;
+
+      detalhes.append(nome, email);
+      item.append(checkbox, detalhes);
+      elLista.appendChild(item);
+    } catch (erro) {
+      if (token) {
+        elLista.textContent = `Falha ao carregar: ${erro.message}`;
+        mostrarStatus(erro.message, 'erro');
+      } else {
+        mostrarStatus(erro.message, 'erro');
       }
-
-      if (!dados.usuarios || dados.usuarios.length === 0) {
-        elLista.innerHTML =
-          '<div class="usuario-item mensagem-lista">Nenhum usuário cadastrado ainda.</div>';
-        return;
-      }
-
-      elLista.innerHTML = '';
-
-      for (const u of dados.usuarios) {
-        const item = document.createElement('label');
-        item.className = 'usuario-item';
-
-        item.innerHTML = `
-          <input type="checkbox" value="${u.id}" class="chk-usuario">
-          <span>
-            <div class="usuario-nome">${escapeHtml(u.nome)}</div>
-            <div class="usuario-email">
-              ${escapeHtml(u.email)} · id ${u.id}
-            </div>
-          </span>
-        `;
-
-        elLista.appendChild(item);
-      }
-
-    } catch (e) {
-      elLista.innerHTML = `
-        <div class="usuario-item mensagem-lista erro">
-          Falha ao carregar: ${escapeHtml(e.message)}
-        </div>
-      `;
+    } finally {
+      elBtnRecarregar.disabled = false;
     }
   }
 
-  function usuariosSelecionados() {
-    return Array.from(
-      document.querySelectorAll('.chk-usuario:checked')
-    ).map(el => parseInt(el.value, 10));
-  }
+  elFormLogin.addEventListener('submit', async (evento) => {
+    evento.preventDefault();
+    mostrarStatus('');
+    elBtnEntrar.disabled = true;
+    elBtnEntrar.textContent = 'Entrando...';
 
-  async function enviar() {
-    const ids = usuariosSelecionados();
-    const titulo = elTitulo.value.trim();
-    const corpo = elCorpo.value.trim();
+    try {
+      const dados = await chamarApi('/api/auth/login', {
+        metodo: 'POST',
+        corpo: {
+          email: document.getElementById('email').value.trim(),
+          senha: document.getElementById('senha').value
+        }
+      });
 
-    elStatus.className = 'status';
-    elStatus.textContent = '';
+      token = dados.token;
+      usuario = dados.usuario;
+      document.getElementById('senha').value = '';
+      atualizarTela();
+      mostrarStatus('Login realizado.', 'ok');
+      await carregarUsuarios();
+    } catch (erro) {
+      mostrarStatus(erro.message, 'erro');
+    } finally {
+      elBtnEntrar.disabled = false;
+      elBtnEntrar.textContent = 'Entrar';
+    }
+  });
 
-    if (ids.length === 0) {
-      elStatus.className = 'status erro';
-      elStatus.textContent = 'Selecione ao menos um usuário.';
+  elFormNotificacao.addEventListener('submit', async (evento) => {
+    evento.preventDefault();
+    mostrarStatus('');
+
+    const selecionado = document.querySelector('.chk-usuario:checked');
+    if (!selecionado) {
+      mostrarStatus('Selecione o destinatário.', 'erro');
       return;
     }
 
+    const titulo = elTitulo.value.trim();
+    const corpo = elCorpo.value.trim();
     if (!titulo || !corpo) {
-      elStatus.className = 'status erro';
-      elStatus.textContent = 'Preencha título e mensagem.';
+      mostrarStatus('Preencha título e mensagem.', 'erro');
       return;
     }
 
     elBtnEnviar.disabled = true;
     elBtnEnviar.textContent = 'Enviando...';
 
-    const resultados = [];
-
-    for (const usuario_id of ids) {
-      try {
-        const resp = await fetch(`${API}/api/notificacoes/enviar`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            usuario_id,
-            titulo,
-            corpo
-          })
-        });
-
-        const dados = await resp.json();
-
-        if (resp.ok) {
-          resultados.push(
-            `usuário ${usuario_id}: ${dados.enviadas} enviada(s)` +
-            (dados.falhas?.length
-              ? `, falhas: ${dados.falhas.join('; ')}`
-              : '')
-          );
-        } else {
-          resultados.push(
-            `usuário ${usuario_id}: erro — ${dados.erro}`
-          );
-        }
-
-      } catch (e) {
-        resultados.push(
-          `usuário ${usuario_id}: falha de conexão — ${e.message}`
-        );
-      }
+    try {
+      // O servidor decide o destinatário pelo JWT, não pelo ID do checkbox.
+      const dados = await chamarApi('/api/notificacoes/enviar', {
+        metodo: 'POST',
+        corpo: { titulo, corpo }
+      });
+      const falhas = dados.falhas?.length ? ` Falhas: ${dados.falhas.join('; ')}` : '';
+      mostrarStatus(`${dados.enviadas} notificação(ões) enviada(s).${falhas}`, falhas ? 'erro' : 'ok');
+    } catch (erro) {
+      mostrarStatus(erro.message, 'erro');
+    } finally {
+      elBtnEnviar.disabled = false;
+      elBtnEnviar.textContent = 'Enviar notificação';
     }
+  });
 
-    elBtnEnviar.disabled = false;
-    elBtnEnviar.textContent = 'Enviar notificação';
+  elBtnSair.addEventListener('click', async () => {
+    elBtnSair.disabled = true;
+    try {
+      await chamarApi('/api/auth/logout', { metodo: 'POST' });
+      encerrarSessaoLocal();
+      mostrarStatus('Sessão encerrada.', 'ok');
+    } catch (erro) {
+      mostrarStatus(erro.message, 'erro');
+    } finally {
+      elBtnSair.disabled = false;
+    }
+  });
 
-    const algumaFalha = resultados.some(
-      r => r.includes('erro') || r.includes('falha')
-    );
-
-    elStatus.className =
-      'status ' + (algumaFalha ? 'erro' : 'ok');
-
-    elStatus.textContent = resultados.join('\n');
-  }
-
-  elBtnEnviar.addEventListener('click', enviar);
   elBtnRecarregar.addEventListener('click', carregarUsuarios);
-
-  carregarUsuarios();
+  atualizarTela();
 </script>
 </body>
 </html>

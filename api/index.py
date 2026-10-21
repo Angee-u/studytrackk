@@ -1,58 +1,301 @@
 import os
 import json
-from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify, redirect
+from datetime import datetime, timedelta, timezone, time
+from zoneinfo import ZoneInfo
+import hashlib
+import hmac
+import secrets
+import re
+from functools import wraps
+from flask import Flask, request, jsonify, g
 import bcrypt
+import jwt
 from supabase import create_client, Client
 
 app = Flask(__name__)
 
-# Variáveis de ambiente configuradas no painel da Vercel
-# (Project Settings > Environment Variables)
+# As credenciais ficam na Vercel, não no código nem no aplicativo.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-
-@app.route("/", methods=["GET"])
-def pagina_inicial():
-    return redirect("/notificacoes.html")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Defina SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+if len(JWT_SECRET.encode("utf-8")) < 32:
+    raise RuntimeError("Defina JWT_SECRET com pelo menos 32 bytes aleatórios")
+JWT_ISSUER = "studytrack-api"
+JWT_AUDIENCE = "studytrack-mobile"
+JWT_TEMPO_MINUTOS = 60
+
+
+def _resumo_senha(senha_hash):
+    # Vincula o token à senha atual: trocar a senha encerra as sessões anteriores.
+    return hmac.new(JWT_SECRET.encode("utf-8"), senha_hash.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _usuario_seguro(usuario):
+    return {chave: valor for chave, valor in usuario.items() if chave != "senha_hash"}
+
+
+def _criar_token(usuario):
+    instante = datetime.now(timezone.utc)
+    claims = {
+        "sub": str(usuario["id"]), "iss": JWT_ISSUER, "aud": JWT_AUDIENCE,
+        "iat": instante, "nbf": instante,
+        "exp": instante + timedelta(minutes=JWT_TEMPO_MINUTOS),
+        "jti": secrets.token_urlsafe(24),
+        "pwd": _resumo_senha(usuario["senha_hash"]),
+    }
+    return jwt.encode(claims, JWT_SECRET, algorithm="HS256")
+
+
+@app.before_request
+def autenticar_requisicao():
+    if request.method == "OPTIONS" or request.path == "/":
+        return None
+    if (request.path == "/api/usuarios" and request.method == "POST") or (
+        request.path in ("/api/auth/login", "/api/auth/recuperar-senha", "/api/auth/redefinir-senha")
+        and request.method == "POST"
+    ) or (request.path == "/api/interno/processar-lembretes" and request.method == "POST"):
+        return None
+
+    cabecalho = request.headers.get("Authorization", "")
+    partes = cabecalho.split()
+    if len(partes) != 2 or partes[0].lower() != "bearer":
+        return jsonify(erro="envie Authorization: Bearer <token>"), 401
+
+    try:
+        claims = jwt.decode(
+            partes[1], JWT_SECRET, algorithms=["HS256"],
+            issuer=JWT_ISSUER, audience=JWT_AUDIENCE,
+            options={"require": ["sub", "iss", "aud", "iat", "nbf", "exp", "jti", "pwd"]},
+            leeway=0,
+        )
+        usuario_id = int(claims["sub"])
+        if usuario_id <= 0:
+            raise ValueError("ID inválido")
+    except (jwt.InvalidTokenError, ValueError, TypeError):
+        return jsonify(erro="token inválido ou expirado"), 401
+
+    try:
+        usuarios = (supabase.table("usuarios")
+                    .select("id, nome, email, senha_hash, criado_em, atualizado_em")
+                    .eq("id", usuario_id).execute().data)
+        if not usuarios or not usuarios[0].get("senha_hash"):
+            return jsonify(erro="usuário não encontrado ou desativado"), 401
+        usuario = usuarios[0]
+        if not hmac.compare_digest(claims["pwd"], _resumo_senha(usuario["senha_hash"])):
+            return jsonify(erro="sessão encerrada, faça login novamente"), 401
+        revogados = (supabase.table("tokens_revogados").select("jti")
+                     .eq("jti", claims["jti"]).execute().data)
+        if revogados:
+            return jsonify(erro="sessão encerrada, faça login novamente"), 401
+        g.usuario_id = usuario_id
+        g.usuario = usuario
+        g.jwt_claims = claims
+    except Exception:
+        app.logger.exception("Falha ao validar sessão JWT")
+        return jsonify(erro="não foi possível validar a sessão"), 503
+    return None
+
+
+def _usuario_logado():
+    return g.usuario_id
+
+
+def _validar_usuario_informado(valor):
+    # Quem identifica o estudante é o JWT, não o ID enviado pelo aplicativo.
+    if valor is None:
+        return None
+    try:
+        if int(valor) != _usuario_logado():
+            return jsonify(erro="não é permitido acessar dados de outro usuário"), 403
+    except (ValueError, TypeError):
+        return jsonify(erro="usuario_id inválido"), 400
+    return None
+
+
+def _pertence_ao_usuario(tabela, registro_id):
+    if tabela == "materias":
+        resposta = (supabase.table("materias").select("id, usuario_id")
+                    .eq("id", registro_id).eq("usuario_id", _usuario_logado()).execute())
+    elif tabela in ("tarefas", "exames"):
+        resposta = (supabase.table(tabela)
+                    .select("id, materia_id, materias!inner(usuario_id)")
+                    .eq("id", registro_id).eq("materias.usuario_id", _usuario_logado()).execute())
+    elif tabela == "horarios_aula":
+        resposta = (supabase.table("horarios_aula")
+                    .select("id, materia_id, materias!inner(usuario_id)")
+                    .eq("id", registro_id).eq("materias.usuario_id", _usuario_logado()).execute())
+    else:
+        return False
+    return bool(resposta.data)
+
+
+def _exigir_propriedade(tabela, registro_id):
+    try:
+        if not _pertence_ao_usuario(tabela, registro_id):
+            return jsonify(erro="registro não encontrado"), 404
+    except Exception:
+        app.logger.exception("Erro ao consultar proprietário do registro")
+        return jsonify(erro="não foi possível verificar o registro"), 503
+    return None
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    dados = request.get_json(silent=True) or {}
+    email_bruto = dados.get("email")
+    email = email_bruto.strip().lower() if isinstance(email_bruto, str) else ""
+    senha = dados.get("senha")
+    if not email or not isinstance(senha, str) or not senha:
+        return jsonify(erro="email e senha são obrigatórios"), 400
+    try:
+        usuarios = (supabase.table("usuarios")
+                    .select("id, nome, email, senha_hash, criado_em, atualizado_em")
+                    .eq("email", email).execute().data)
+        usuario = usuarios[0] if usuarios else None
+        # Verificamos um hash fictício para e-mails desconhecidos, reduzindo diferenças de tempo na resposta.
+        hash_armazenado = usuario.get("senha_hash") if usuario else None
+        hash_verificado = hash_armazenado or "$2b$12$C6UzMDM.H6dfI/f/IKcEeO6WaN0AkYQvG3bF6cCFNE9Y.l2nY0fZS"
+        valido = bcrypt.checkpw(senha.encode("utf-8"), hash_verificado.encode("utf-8"))
+        if not usuario or not valido:
+            return jsonify(erro="email ou senha inválidos"), 401
+        return jsonify(token=_criar_token(usuario), tipo="Bearer",
+                       expira_em_segundos=JWT_TEMPO_MINUTOS * 60,
+                       usuario=_usuario_seguro(usuario)), 200
+    except (ValueError, TypeError):
+        return jsonify(erro="email ou senha inválidos"), 401
+    except Exception:
+        app.logger.exception("Falha durante o login")
+        return jsonify(erro="não foi possível realizar o login"), 503
+
+
+@app.route("/api/auth/me", methods=["GET"])
+def meu_perfil():
+    return jsonify(usuario=_usuario_seguro(g.usuario)), 200
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    # Guardamos o identificador do token para que ele pare de valer antes de expirar.
+    claims = g.jwt_claims
+    try:
+        supabase.table("tokens_revogados").insert({
+            "jti": claims["jti"], "usuario_id": _usuario_logado(),
+            "expira_em": datetime.fromtimestamp(claims["exp"], timezone.utc).isoformat(),
+        }).execute()
+        return jsonify(mensagem="sessão encerrada"), 200
+    except Exception:
+        app.logger.exception("Falha ao encerrar sessão")
+        return jsonify(erro="não foi possível encerrar a sessão"), 503
+
+
+
+@app.route("/", methods=["GET"])
+def inicio():
+    """Mostra que a API está respondendo quando alguém acessa a raiz."""
+    return jsonify({
+        "projeto": "studyTrack",
+        "status": "online",
+        "mensagem": "Backend disponível. A interface completa do app não está neste repositório."
+    }), 200
+
 
 def hash_senha(senha_plana: str) -> str:
-    """Gera um hash bcrypt da senha. Nunca guardamos texto plano."""
+    """Gera o hash bcrypt que será salvo no lugar da senha."""
     return bcrypt.hashpw(senha_plana.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
 def agora():
-    """Agora em UTC (sem fuso) — mesmo padrão do CURRENT_TIMESTAMP do banco. Usado em atualizado_em."""
+    """Retorna o horário UTC sem fuso para os campos atualizado_em."""
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
 def agora_brasil():
-    """
-    Agora no horário de Brasília (UTC-3, sem horário de verão desde 2019).
-    Usado para comparar com datas digitadas pelo aluno (data_entrega, data_hora),
-    que são guardadas sem fuso horário.
-    """
+    """Usa o horário de Brasília para comparar datas salvas sem fuso horário."""
     return datetime.now(timezone(timedelta(hours=-3))).replace(tzinfo=None).isoformat()
 
 
+def agora_do_usuario():
+    """Usa o fuso do estudante ao consultar prazos; São Paulo é o padrão inicial."""
+    fuso = "America/Sao_Paulo"
+    try:
+        preferencias = (supabase.table("preferencias_notificacao")
+                        .select("fuso_horario").eq("usuario_id", _usuario_logado())
+                        .execute().data)
+        if preferencias and preferencias[0].get("fuso_horario"):
+            fuso = preferencias[0]["fuso_horario"]
+        return datetime.now(ZoneInfo(fuso)).replace(tzinfo=None).isoformat()
+    except Exception:
+        app.logger.exception("Não foi possível consultar o fuso horário")
+        return agora_brasil()
+
+
 def erro_banco(e):
-    """Traduz erros comuns do Postgres/Supabase para respostas HTTP claras."""
+    """Devolve mensagens mais úteis para erros conhecidos do banco."""
     msg = str(e)
     if "23503" in msg or "foreign key" in msg.lower():
         return jsonify(erro="referência inválida: o id informado (usuário/matéria) não existe"), 400
     if "invalid input value for enum" in msg:
         return jsonify(erro="valor inválido para um campo de opções (ex.: status)"), 400
-    return jsonify(erro=msg), 500
+    app.logger.exception("Erro inesperado no banco")
+    return jsonify(erro="erro interno ao acessar o banco"), 500
+
+
+def validar_horario_iso(dados, obrigatorio=False):
+    """Confere os horários e os dias conforme o padrão ISO (segunda=1, domingo=7)."""
+    if not isinstance(dados, dict):
+        raise ValueError("o horário deve ser um objeto")
+    campos = ("dia_semana", "hora_inicio", "hora_fim")
+    if obrigatorio and any(c not in dados for c in campos):
+        raise ValueError("dia_semana, hora_inicio e hora_fim são obrigatórios")
+    if "dia_semana" in dados:
+        dia = dados["dia_semana"]
+        if type(dia) is not int or not 1 <= dia <= 7:
+            raise ValueError("dia_semana deve estar entre 1 (segunda) e 7 (domingo)")
+    horarios = {}
+    for campo in ("hora_inicio", "hora_fim"):
+        if campo in dados:
+            valor = dados[campo]
+            if not isinstance(valor, str) or not re.fullmatch(r"[0-2][0-9]:[0-5][0-9](?::[0-5][0-9])?", valor):
+                raise ValueError(f"{campo} deve ser uma hora válida (HH:MM)")
+            try:
+                horario = time.fromisoformat(valor)
+                if horario.tzinfo is not None:
+                    raise ValueError()
+            except ValueError:
+                raise ValueError(f"{campo} deve ser uma hora válida (HH:MM)") from None
+            horarios[campo] = horario
+    if "hora_inicio" in horarios and "hora_fim" in horarios:
+        if horarios["hora_fim"] <= horarios["hora_inicio"]:
+            raise ValueError("hora_fim deve ser posterior a hora_inicio")
 
 
 def atualizar(tabela, registro_id, dados, permitidos, chave, com_timestamp=True):
-    """UPDATE genérico: só altera os campos permitidos que vieram no corpo."""
+    """Atualiza somente os campos recebidos, após conferir o dono do registro."""
+    negado = _exigir_propriedade(tabela, registro_id)
+    if negado:
+        return negado
+    if tabela == "horarios_aula":
+        try:
+            atual = (supabase.table("horarios_aula")
+                     .select("dia_semana,hora_inicio,hora_fim")
+                     .eq("id", registro_id).execute().data)
+            if not atual:
+                return jsonify(erro="horário não encontrado"), 404
+            validar_horario_iso({**atual[0], **dados}, obrigatorio=True)
+        except ValueError as e:
+            return jsonify(erro=str(e)), 400
+        except Exception as e:
+            return erro_banco(e)
+    if tabela in ("tarefas", "exames") and "materia_id" in dados:
+        negado = _exigir_propriedade("materias", dados["materia_id"])
+        if negado:
+            return negado
     campos = {c: dados[c] for c in permitidos if c in dados}
     if not campos:
         return jsonify(erro="envie ao menos um campo: " + ", ".join(permitidos)), 400
@@ -68,7 +311,10 @@ def atualizar(tabela, registro_id, dados, permitidos, chave, com_timestamp=True)
 
 
 def apagar(tabela, registro_id):
-    """DELETE genérico por id."""
+    """Exclui um registro somente depois de conferir a quem pertence."""
+    negado = _exigir_propriedade(tabela, registro_id)
+    if negado:
+        return negado
     try:
         resp = supabase.table(tabela).delete().eq("id", registro_id).execute()
         if not resp.data:
@@ -80,43 +326,48 @@ def apagar(tabela, registro_id):
 
 @app.after_request
 def liberar_cors(response):
-    # Equivalente ao middleware cors() do Express — libera o front (Flutter/app)
-    # a chamar esses endpoints de outra origem.
+    # Libera chamadas do front web em outra origem. Flutter nativo não depende de CORS.
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
 
 @app.route("/api/usuarios", methods=["GET"])
 def listar_usuarios():
-    """Lista usuários (sem expor o hash da senha)."""
+    """Mostra apenas os dados da conta autenticada, sem a senha_hash."""
     try:
         resp = (
             supabase.table("usuarios")
             .select("id, nome, email, criado_em, atualizado_em")
+            .eq("id", _usuario_logado())
             .order("id")
             .execute()
         )
         return jsonify(usuarios=resp.data), 200
     except Exception as e:
-        return jsonify(erro=str(e)), 500
+        app.logger.exception("Falha ao listar usuários")
+        return jsonify(erro="não foi possível listar os usuários"), 500
 
 
 @app.route("/api/usuarios", methods=["POST"])
 def criar_usuario():
-    """Cria um novo usuário (cadastro)."""
+    """Cadastra uma conta de estudante."""
     dados = request.get_json(silent=True) or {}
 
-    nome = (dados.get("nome") or "").strip()
-    email = (dados.get("email") or "").strip().lower()
-    senha = dados.get("senha") or ""
+    nome = dados.get("nome")
+    email = dados.get("email")
+    senha = dados.get("senha")
+    if not isinstance(nome, str) or not isinstance(email, str) or not isinstance(senha, str):
+        return jsonify(erro="nome, email e senha devem ser textos"), 400
+    nome = nome.strip()
+    email = email.strip().lower()
 
     if not nome or not email or not senha:
         return jsonify(erro="nome, email e senha são obrigatórios"), 400
 
-    if len(senha) < 6:
-        return jsonify(erro="senha deve ter pelo menos 6 caracteres"), 400
+    if len(senha) < 8 or len(senha.encode("utf-8")) > 72:
+        return jsonify(erro="senha precisa ter 8 caracteres e no máximo 72 bytes"), 400
 
     senha_hash = hash_senha(senha)
 
@@ -127,42 +378,52 @@ def criar_usuario():
             .execute()
         )
         usuario_criado = resp.data[0]
-        usuario_criado.pop("senha_hash", None)  # nunca retornar o hash
+        usuario_criado.pop("senha_hash", None)  # O hash da senha não deve sair na resposta.
         return jsonify(usuario=usuario_criado), 201
 
     except Exception as e:
         msg = str(e)
-        # Supabase retorna erro de UNIQUE constraint quando o email já existe
+        # O Supabase sinaliza e-mail repetido como erro de unicidade.
         if "duplicate key" in msg or "usuarios_email_key" in msg:
             return jsonify(erro="e-mail já cadastrado"), 409
-        return jsonify(erro=msg), 500
+        app.logger.exception("Falha ao cadastrar usuário")
+        return jsonify(erro="erro interno ao cadastrar usuário"), 500
 
 
 @app.route("/api/usuarios/<int:usuario_id>", methods=["PUT"])
 def editar_usuario(usuario_id):
-    """Edita um usuário existente. Só atualiza os campos que vierem no corpo."""
+    """Altera somente os dados enviados para a conta atual."""
     dados = request.get_json(silent=True) or {}
 
-    # Monta o dicionário só com o que foi enviado — assim dá pra atualizar
-    # apenas o nome, só a senha, ou os três juntos, sem apagar o resto.
+    if usuario_id != _usuario_logado():
+        return jsonify(erro="não é permitido editar outro usuário"), 403
+    # A senha atual é necessária para alterar dados sensíveis.
     campos_para_atualizar = {}
+    if "email" in dados or "senha" in dados:
+        atual = dados.get("senha_atual") or ""
+        if not isinstance(atual, str) or not bcrypt.checkpw(
+            atual.encode("utf-8"), g.usuario["senha_hash"].encode("utf-8")
+        ):
+            return jsonify(erro="senha_atual inválida"), 403
 
     if "nome" in dados:
-        nome = (dados.get("nome") or "").strip()
+        nome = dados.get("nome")
+        nome = nome.strip() if isinstance(nome, str) else ""
         if not nome:
             return jsonify(erro="nome não pode ser vazio"), 400
         campos_para_atualizar["nome"] = nome
 
     if "email" in dados:
-        email = (dados.get("email") or "").strip().lower()
+        email = dados.get("email")
+        email = email.strip().lower() if isinstance(email, str) else ""
         if not email:
             return jsonify(erro="email não pode ser vazio"), 400
         campos_para_atualizar["email"] = email
 
     if "senha" in dados:
-        senha = dados.get("senha") or ""
-        if len(senha) < 6:
-            return jsonify(erro="senha deve ter pelo menos 6 caracteres"), 400
+        senha = dados.get("senha")
+        if not isinstance(senha, str) or len(senha) < 8 or len(senha.encode("utf-8")) > 72:
+            return jsonify(erro="senha precisa ter 8 caracteres e no máximo 72 bytes"), 400
         campos_para_atualizar["senha_hash"] = hash_senha(senha)
 
     if not campos_para_atualizar:
@@ -189,36 +450,38 @@ def editar_usuario(usuario_id):
         msg = str(e)
         if "duplicate key" in msg or "usuarios_email_key" in msg:
             return jsonify(erro="e-mail já cadastrado"), 409
-        return jsonify(erro=msg), 500
+        app.logger.exception("Falha ao atualizar usuário")
+        return jsonify(erro="erro interno ao atualizar usuário"), 500
 
 
 @app.route("/api/usuarios/<int:usuario_id>", methods=["DELETE"])
 def apagar_usuario(usuario_id):
-    """Apaga o usuário e todos os dados dele (matérias, horários, tarefas, exames, locais, preferências)."""
+    if usuario_id != _usuario_logado():
+        return jsonify(erro="não é permitido apagar outro usuário"), 403
+    # Confirma a senha antes de excluir a conta.
+    dados = request.get_json(silent=True) or {}
+    senha = dados.get("senha_atual") or ""
+    if not isinstance(senha, str) or not bcrypt.checkpw(
+        senha.encode("utf-8"), g.usuario["senha_hash"].encode("utf-8")
+    ):
+        return jsonify(erro="senha_atual inválida"), 403
+    # O banco remove os dados relacionados de uma vez, sem exclusão pela metade.
     try:
-        materias = supabase.table("materias").select("id").eq("usuario_id", usuario_id).execute().data
-        ids = [m["id"] for m in materias]
-        if ids:
-            for tabela in ("horarios_aula", "tarefas", "exames"):
-                supabase.table(tabela).delete().in_("materia_id", ids).execute()
-            supabase.table("materias").delete().in_("id", ids).execute()
-
-        supabase.table("locais").delete().eq("usuario_id", usuario_id).execute()
-        supabase.table("preferencias_notificacao").delete().eq("usuario_id", usuario_id).execute()
+        excluiu = supabase.rpc("excluir_conta_studytrack", {"p_usuario_id": usuario_id}).execute().data
+        return (jsonify(mensagem="conta excluída"), 200) if excluiu is True else (jsonify(erro="usuário não encontrado"), 404)
     except Exception as e:
         return erro_banco(e)
 
-    return apagar("usuarios", usuario_id)
 
-
-# ===============================================================
-# MATÉRIAS  (+ horários de aula)
+# Matérias e horários de aula
 @app.route("/api/materias", methods=["GET"])
 def listar_materias():
-    """Lista as matérias de um usuário, já com os horários de aula de cada uma."""
+    """Traz as matérias do estudante junto com os horários de aula."""
     usuario_id = request.args.get("usuario_id", type=int)
-    if not usuario_id:
-        return jsonify(erro="usuario_id é obrigatório (?usuario_id=1)"), 400
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
     try:
         resp = (
             supabase.table("materias")
@@ -234,19 +497,29 @@ def listar_materias():
 
 @app.route("/api/materias", methods=["POST"])
 def criar_materia():
-    """Cria matéria. Opcionalmente já recebe a lista de horarios de aula."""
+    """Cria uma matéria e, se vierem na requisição, seus horários de aula."""
     dados = request.get_json(silent=True) or {}
     usuario_id = dados.get("usuario_id")
     nome = (dados.get("nome") or "").strip()
     cor = (dados.get("cor") or "").strip()
 
-    if not usuario_id or not nome or not cor:
-        return jsonify(erro="usuario_id, nome e cor são obrigatórios"), 400
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
+    if not nome or not cor:
+        return jsonify(erro="nome e cor são obrigatórios"), 400
 
-    horarios = dados.get("horarios") or []
-    for h in horarios:
-        if h.get("dia_semana") is None or not h.get("hora_inicio") or not h.get("hora_fim"):
-            return jsonify(erro="cada horário precisa de dia_semana, hora_inicio e hora_fim"), 400
+    horarios = dados.get("horarios", [])
+    if horarios is None:
+        horarios = []
+    if not isinstance(horarios, list):
+        return jsonify(erro="horarios deve ser uma lista"), 400
+    try:
+        for h in horarios:
+            validar_horario_iso(h, obrigatorio=True)
+    except ValueError as e:
+        return jsonify(erro=str(e)), 400
 
     materia = None
     try:
@@ -276,7 +549,7 @@ def criar_materia():
 
         return jsonify(materia=materia), 201
     except Exception as e:
-        if materia:  # não deixa matéria "pela metade" se os horários falharam
+        if materia:  # Desfaz o cadastro se algum horário não puder ser salvo.
             supabase.table("materias").delete().eq("id", materia["id"]).execute()
         return erro_banco(e)
 
@@ -289,7 +562,10 @@ def editar_materia(materia_id):
 
 @app.route("/api/materias/<int:materia_id>", methods=["DELETE"])
 def apagar_materia(materia_id):
-    """Apaga a matéria e tudo que depende dela (horários, tarefas e exames)."""
+    """Remove a matéria e seus horários, tarefas e exames."""
+    negado = _exigir_propriedade("materias", materia_id)
+    if negado:
+        return negado
     try:
         for tabela in ("horarios_aula", "tarefas", "exames"):
             supabase.table(tabela).delete().eq("materia_id", materia_id).execute()
@@ -300,9 +576,14 @@ def apagar_materia(materia_id):
 
 @app.route("/api/materias/<int:materia_id>/horarios", methods=["POST"])
 def criar_horario(materia_id):
+    negado = _exigir_propriedade("materias", materia_id)
+    if negado:
+        return negado
     dados = request.get_json(silent=True) or {}
-    if dados.get("dia_semana") is None or not dados.get("hora_inicio") or not dados.get("hora_fim"):
-        return jsonify(erro="dia_semana, hora_inicio e hora_fim são obrigatórios"), 400
+    try:
+        validar_horario_iso(dados, obrigatorio=True)
+    except ValueError as e:
+        return jsonify(erro=str(e)), 400
     try:
         resp = (
             supabase.table("horarios_aula")
@@ -333,20 +614,18 @@ def apagar_horario(horario_id):
     return apagar("horarios_aula", horario_id)
 
 
-# ===============================================================
-# TAREFAS
+# Tarefas
 @app.route("/api/tarefas", methods=["GET"])
 def listar_tarefas():
-    """
-    Lista tarefas de um usuário.
-    Filtros opcionais: ?materia_id=3  ?status=pendente  ?vencidas=true
-    """
+    """Lista as tarefas, com filtros opcionais de matéria, status e atraso."""
     usuario_id = request.args.get("usuario_id", type=int)
-    if not usuario_id:
-        return jsonify(erro="usuario_id é obrigatório (?usuario_id=1)"), 400
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
 
     try:
-        # materias!inner faz o JOIN para filtrar pelo dono da matéria
+        # A junção com matérias garante que só apareçam tarefas do estudante.
         q = (
             supabase.table("tarefas")
             .select("*, materias!inner(usuario_id, nome, cor)")
@@ -362,7 +641,7 @@ def listar_tarefas():
             q = q.eq("status", status)
 
         if request.args.get("vencidas") == "true":
-            q = q.eq("status", "pendente").lt("data_entrega", agora_brasil())
+            q = q.eq("status", "pendente").lt("data_entrega", agora_do_usuario())
 
         resp = q.order("data_entrega").execute()
         return jsonify(tarefas=resp.data), 200
@@ -379,12 +658,15 @@ def criar_tarefa():
 
     if not materia_id or not titulo or not data_entrega:
         return jsonify(erro="materia_id, titulo e data_entrega são obrigatórios"), 400
+    negado = _exigir_propriedade("materias", materia_id)
+    if negado:
+        return negado
 
     novo = {"materia_id": materia_id, "titulo": titulo, "data_entrega": data_entrega}
     if dados.get("descricao") is not None:
         novo["descricao"] = dados["descricao"]
     if dados.get("status"):
-        novo["status"] = dados["status"]  # se omitido, o banco usa 'pendente'
+        novo["status"] = dados["status"]  # Sem status informado, o banco usa "pendente".
 
     try:
         resp = supabase.table("tarefas").insert(novo).execute()
@@ -395,7 +677,7 @@ def criar_tarefa():
 
 @app.route("/api/tarefas/<int:tarefa_id>", methods=["PUT"])
 def editar_tarefa(tarefa_id):
-    """Serve também para marcar como concluída: {"status": "<valor do enum>"}."""
+    """Também permite marcar a tarefa como concluída pelo campo status."""
     dados = request.get_json(silent=True) or {}
     return atualizar(
         "tarefas", tarefa_id, dados,
@@ -408,17 +690,15 @@ def apagar_tarefa(tarefa_id):
     return apagar("tarefas", tarefa_id)
 
 
-# ===============================================================
-# EXAMES
+# Exames
 @app.route("/api/exames", methods=["GET"])
 def listar_exames():
-    """
-    Lista exames de um usuário.
-    Filtros opcionais: ?materia_id=3  ?proximos=true (só a partir de agora)
-    """
+    """Lista provas e permite filtrar por matéria ou mostrar só as futuras."""
     usuario_id = request.args.get("usuario_id", type=int)
-    if not usuario_id:
-        return jsonify(erro="usuario_id é obrigatório (?usuario_id=1)"), 400
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
 
     try:
         q = (
@@ -432,7 +712,7 @@ def listar_exames():
             q = q.eq("materia_id", materia_id)
 
         if request.args.get("proximos") == "true":
-            q = q.gte("data_hora", agora_brasil())
+            q = q.gte("data_hora", agora_do_usuario())
 
         resp = q.order("data_hora").execute()
         return jsonify(exames=resp.data), 200
@@ -448,6 +728,9 @@ def criar_exame():
 
     if not materia_id or not data_hora:
         return jsonify(erro="materia_id e data_hora são obrigatórios"), 400
+    negado = _exigir_propriedade("materias", materia_id)
+    if negado:
+        return negado
 
     try:
         resp = (
@@ -475,19 +758,14 @@ def apagar_exame(exame_id):
     return apagar("exames", exame_id)
 
 
-# ===============================================================
-# NOTIFICAÇÕES PUSH (Firebase Cloud Messaging — API HTTP v1)
-# Precisa da variável de ambiente FIREBASE_CREDENTIALS com o JSON da
-# service account do Firebase, colado em UMA linha só.
-
-# Verificar na aula caso o Nico não me envie antes.
-# ===============================================================
+# Notificações push pelo Firebase. FIREBASE_CREDENTIALS deve conter o JSON
+# da conta de serviço, configurado apenas no ambiente do servidor.
 FCM_SCOPES = ["https://www.googleapis.com/auth/firebase.messaging"]
 _fcm_creds = None
 
 
 def _credenciais_fcm():
-    """Carrega (uma vez) as credenciais do Firebase e renova o token de acesso quando expira."""
+    """Reutiliza as credenciais do Firebase e renova o acesso quando necessário."""
     global _fcm_creds
     if _fcm_creds is None:
         from google.oauth2 import service_account
@@ -506,14 +784,14 @@ def _credenciais_fcm():
 
 
 def enviar_push(fcm_token, titulo, corpo, dados=None):
-    """Envia uma notificação para UM aparelho. Retorna (ok, detalhe)."""
+    """Envia o push para um dispositivo e informa se deu certo."""
     import requests
 
     creds = _credenciais_fcm()
     url = f"https://fcm.googleapis.com/v1/projects/{creds.project_id}/messages:send"
     mensagem = {"token": fcm_token, "notification": {"title": titulo, "body": corpo}}
     if dados:
-        mensagem["data"] = {str(k): str(v) for k, v in dados.items()}  # FCM só aceita texto aqui
+        mensagem["data"] = {str(k): str(v) for k, v in dados.items()}  # Os valores do payload do FCM precisam ser strings.
 
     r = requests.post(
         url,
@@ -524,16 +802,16 @@ def enviar_push(fcm_token, titulo, corpo, dados=None):
     if r.status_code == 200:
         return True, "enviada"
 
-    # Token de aparelho que não existe mais (app desinstalado): remove do banco
+    # Remove tokens inválidos para não continuar tentando enviar ao mesmo aparelho.
     if r.status_code == 404 and "UNREGISTERED" in r.text:
-        supabase.table("dispositivos").delete().eq("fcm_token", fcm_token).execute()
+        supabase.table("dispositivos").delete().eq("fcm_token", fcm_token).eq("usuario_id", _usuario_logado()).execute()
         return False, "aparelho não registrado (token removido)"
     return False, r.text
 
 
 @app.route("/api/notificacoes/status", methods=["GET"])
 def status_firebase():
-    """Diagnóstico: confirma que a variável FIREBASE_CREDENTIALS foi lida (sem mostrar segredos)."""
+    """Verifica a configuração do Firebase sem mostrar as credenciais."""
     try:
         from google.oauth2 import service_account
 
@@ -549,12 +827,16 @@ def status_firebase():
 
 @app.route("/api/dispositivos", methods=["POST"])
 def registrar_dispositivo():
-    """O app chama isso ao abrir/logar, mandando o token FCM do aparelho."""
+    """Registra o token FCM recebido do aplicativo."""
     dados = request.get_json(silent=True) or {}
     usuario_id = dados.get("usuario_id")
     fcm_token = (dados.get("fcm_token") or "").strip()
-    if not usuario_id or not fcm_token:
-        return jsonify(erro="usuario_id e fcm_token são obrigatórios"), 400
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
+    if not fcm_token:
+        return jsonify(erro="fcm_token é obrigatório"), 400
     try:
         resp = (
             supabase.table("dispositivos")
@@ -568,12 +850,12 @@ def registrar_dispositivo():
 
 @app.route("/api/dispositivos", methods=["DELETE"])
 def remover_dispositivo():
-    """O app chama isso no logout: ?fcm_token=..."""
+    """Desvincula o dispositivo no logout, usando o fcm_token informado."""
     fcm_token = request.args.get("fcm_token", "").strip()
     if not fcm_token:
         return jsonify(erro="fcm_token é obrigatório (?fcm_token=...)"), 400
     try:
-        supabase.table("dispositivos").delete().eq("fcm_token", fcm_token).execute()
+        supabase.table("dispositivos").delete().eq("fcm_token", fcm_token).eq("usuario_id", _usuario_logado()).execute()
         return jsonify(mensagem="dispositivo removido"), 200
     except Exception as e:
         return erro_banco(e)
@@ -581,13 +863,17 @@ def remover_dispositivo():
 
 @app.route("/api/notificacoes/enviar", methods=["POST"])
 def enviar_notificacao():
-    """Envia uma notificação para todos os aparelhos de um usuário."""
+    """Envia a mensagem aos dispositivos da conta autenticada."""
     dados = request.get_json(silent=True) or {}
     usuario_id = dados.get("usuario_id")
     titulo = (dados.get("titulo") or "").strip()
     corpo = (dados.get("corpo") or "").strip()
-    if not usuario_id or not titulo or not corpo:
-        return jsonify(erro="usuario_id, titulo e corpo são obrigatórios"), 400
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
+    if not titulo or not corpo:
+        return jsonify(erro="titulo e corpo são obrigatórios"), 400
 
     try:
         aparelhos = (
@@ -607,3 +893,184 @@ def enviar_notificacao():
     enviadas = sum(1 for ok, _ in resultados if ok)
     falhas = [detalhe for ok, detalhe in resultados if not ok]
     return jsonify(enviadas=enviadas, falhas=falhas), (200 if enviadas else 502)
+
+# Calendário e progresso, calculados a partir dos dados já cadastrados.
+
+
+def _periodo_consulta():
+    """Limita o intervalo consultado para evitar buscas grandes demais."""
+    inicio_bruto = request.args.get("inicio", "")
+    fim_bruto = request.args.get("fim", "")
+    try:
+        inicio = datetime.strptime(inicio_bruto, "%Y-%m-%d").date()
+        fim = datetime.strptime(fim_bruto, "%Y-%m-%d").date()
+    except ValueError:
+        return None, None, "informe inicio e fim no formato AAAA-MM-DD"
+
+    if fim < inicio:
+        return None, None, "fim não pode ser anterior a inicio"
+    if (fim - inicio).days > 92:
+        return None, None, "consulte no máximo 93 dias de cada vez"
+    return inicio, fim, None
+
+
+@app.route("/api/calendario", methods=["GET"])
+def consultar_calendario():
+    """Combina provas, tarefas e aulas no período solicitado."""
+    usuario_id = request.args.get("usuario_id", type=int)
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
+
+    inicio, fim, mensagem = _periodo_consulta()
+    if mensagem:
+        return jsonify(erro=mensagem), 400
+
+    de = f"{inicio.isoformat()}T00:00:00"
+    ate = f"{fim.isoformat()}T23:59:59.999999"
+    try:
+        tarefas = (
+            supabase.table("tarefas")
+            .select("id, materia_id, titulo, descricao, status, data_entrega, materias!inner(id, usuario_id, nome, cor)")
+            .eq("materias.usuario_id", usuario_id)
+            .gte("data_entrega", de)
+            .lte("data_entrega", ate)
+            .order("data_entrega")
+            .execute().data
+        )
+        exames = (
+            supabase.table("exames")
+            .select("id, materia_id, descricao, data_hora, materias!inner(id, usuario_id, nome, cor)")
+            .eq("materias.usuario_id", usuario_id)
+            .gte("data_hora", de)
+            .lte("data_hora", ate)
+            .order("data_hora")
+            .execute().data
+        )
+        materias = (
+            supabase.table("materias")
+            .select("id, nome, cor, horarios_aula(id, dia_semana, hora_inicio, hora_fim)")
+            .eq("usuario_id", usuario_id)
+            .execute().data
+        )
+        eventos = []
+        for tarefa in tarefas:
+            eventos.append({
+                "tipo": "tarefa",
+                "id": tarefa["id"],
+                "materia_id": tarefa["materia_id"],
+                "materia_nome": tarefa["materias"]["nome"],
+                "cor": tarefa["materias"]["cor"],
+                "titulo": tarefa["titulo"],
+                "descricao": tarefa.get("descricao"),
+                "data_hora": tarefa["data_entrega"],
+                "status": tarefa["status"],
+            })
+        for exame in exames:
+            eventos.append({
+                "tipo": "exame",
+                "id": exame["id"],
+                "materia_id": exame["materia_id"],
+                "materia_nome": exame["materias"]["nome"],
+                "cor": exame["materias"]["cor"],
+                "titulo": "Exame",
+                "descricao": exame.get("descricao"),
+                "data_hora": exame["data_hora"],
+            })
+        eventos.sort(key=lambda item: item["data_hora"])
+        aulas_semanais = [
+            {
+                "materia_id": materia["id"],
+                "materia_nome": materia["nome"],
+                "cor": materia["cor"],
+                **horario,
+            }
+            for materia in materias
+            for horario in (materia.get("horarios_aula") or [])
+        ]
+        return jsonify(
+            inicio=inicio.isoformat(),
+            fim=fim.isoformat(),
+            eventos=eventos,
+            aulas_semanais=aulas_semanais,
+        ), 200
+    except Exception as e:
+        return erro_banco(e)
+
+
+@app.route("/api/progresso", methods=["GET"])
+def consultar_progresso():
+    """Calcula o progresso com base nas tarefas que já estão no banco."""
+    usuario_id = request.args.get("usuario_id", type=int)
+    negado = _validar_usuario_informado(usuario_id)
+    if negado:
+        return negado
+    usuario_id = _usuario_logado()
+
+    try:
+        materias = (
+            supabase.table("materias")
+            .select("id, nome, cor")
+            .eq("usuario_id", usuario_id)
+            .order("nome")
+            .execute().data
+        )
+        tarefas = (
+            supabase.table("tarefas")
+            .select("id, materia_id, status, data_entrega, materias!inner(usuario_id)")
+            .eq("materias.usuario_id", usuario_id)
+            .execute().data
+        )
+
+        por_materia = {
+            materia["id"]: {
+                "materia_id": materia["id"],
+                "materia_nome": materia["nome"],
+                "cor": materia["cor"],
+                "total": 0,
+                "concluidas": 0,
+                "pendentes": 0,
+                "vencidas": 0,
+                "percentual": 0,
+            }
+            for materia in materias
+        }
+        agora_local = agora_do_usuario()
+        for tarefa in tarefas:
+            resumo = por_materia.get(tarefa["materia_id"])
+            if resumo is None:
+                continue
+            resumo["total"] += 1
+            concluida = str(tarefa.get("status", "")).strip().lower() in ("concluida", "concluido")
+            if concluida:
+                resumo["concluidas"] += 1
+            else:
+                resumo["pendentes"] += 1
+                data_entrega = tarefa.get("data_entrega")
+                if data_entrega and data_entrega < agora_local:
+                    resumo["vencidas"] += 1
+
+        for resumo in por_materia.values():
+            if resumo["total"]:
+                resumo["percentual"] = round(100 * resumo["concluidas"] / resumo["total"], 2)
+
+        total = sum(m["total"] for m in por_materia.values())
+        concluidas = sum(m["concluidas"] for m in por_materia.values())
+        pendentes = sum(m["pendentes"] for m in por_materia.values())
+        vencidas = sum(m["vencidas"] for m in por_materia.values())
+        return jsonify(
+            total=total,
+            concluidas=concluidas,
+            pendentes=pendentes,
+            vencidas=vencidas,
+            percentual=round(100 * concluidas / total, 2) if total else 0,
+            por_materia=list(por_materia.values()),
+        ), 200
+    except Exception as e:
+        return erro_banco(e)
+
+
+# As rotas de GPS, QR Code e lembretes ficam em um módulo separado.
+from api.recursos import registrar_rotas_complementares
+registrar_rotas_complementares(app, supabase, g, request, jsonify, _exigir_propriedade, hash_senha, enviar_push)

@@ -1,18 +1,40 @@
-# Ambiente virtual Python
+# Arquivos gerados pelo Python e ambientes locais
+__pycache__/
+*.py[cod]
 .venv/
 venv/
-__pycache__/
-*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# Variáveis de ambiente (NUNCA versionar segredos)
+# Configurações locais, credenciais e logs
 .env
-.env.local
-.env*.local
+.env.*
+!.env.example
+*.pem
+*.key
+serviceAccountKey.json
+*.log
 
-# Vercel
-.vercel
-
-# Editor
-.vscode/
+# Arquivos do editor, sistema e Vercel
+.vercel/
 .idea/
-.env*
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Documentos e arquivos usados apenas no desenvolvimento
+*.md
+*.txt
+!requirements.txt
+!README.md
+migrations/
+tests/
+VERIFICAR_APOS_MIGRACOES.sql
+
+# Pacotes compactados e a cópia antiga da página de testes
+*.zip
+*.rar
+public_notificacoes.html
