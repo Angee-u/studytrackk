@@ -6,11 +6,12 @@ import os
 import re
 import secrets
 import smtplib
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.message import EmailMessage
 import ssl
 from urllib.parse import urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from api.sincronizacao import criar_com_chave, versao_informada
 
 
 PREFERENCIAS_PADRAO = {
@@ -23,6 +24,9 @@ PREFERENCIAS_PADRAO = {
     "hora_lembrete_estudo": None,
     "fuso_horario": "America/Sao_Paulo",
 }
+
+INTERVALO_LEMBRETES = timedelta(minutes=15)
+TOLERANCIA_LEMBRETES = timedelta(hours=1)
 
 
 def _validar_preferencias(dados):
@@ -168,6 +172,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
             return jsonify(erro=str(e)), 400
         try:
             dados.update(usuario_id=g.usuario_id)
+            offline = criar_com_chave(supabase, request, jsonify, g.usuario_id, "locais", dados, "local")
+            if offline is not None:
+                return offline
             return jsonify(local=supabase.table("locais").insert(dados).execute().data[0]), 201
         except Exception:
             return erro_interno("Erro ao cadastrar local; confira os valores permitidos pelo enum locais.tipo")
@@ -187,18 +194,34 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
             if not local_do_usuario(local_id):
                 return jsonify(erro="local não encontrado"), 404
             dados["atualizado_em"] = datetime.now(timezone.utc).isoformat()
-            resultado = (supabase.table("locais").update(dados).eq("id", local_id)
-                         .eq("usuario_id", g.usuario_id).execute().data)
+            versao = versao_informada(request)
+            consulta = supabase.table("locais").update(dados).eq("id", local_id).eq("usuario_id", g.usuario_id)
+            if versao is not None:
+                consulta = consulta.eq("atualizado_em", versao)
+            resultado = consulta.execute().data
+            if not resultado:
+                if versao is not None:
+                    return jsonify(erro="registro mudou desde a última sincronização"), 409
+                return jsonify(erro="local não encontrado"), 404
             return jsonify(local=resultado[0]), 200
+        except ValueError as e:
+            return jsonify(erro=str(e)), 400
         except Exception:
             return erro_interno("Erro ao editar local")
 
     @app.route("/api/locais/<int:local_id>", methods=["DELETE"])
     def excluir_local(local_id):
         try:
-            rows = (supabase.table("locais").delete().eq("id", local_id)
-                    .eq("usuario_id", g.usuario_id).execute().data)
+            versao = versao_informada(request)
+            consulta = supabase.table("locais").delete().eq("id", local_id).eq("usuario_id", g.usuario_id)
+            if versao is not None:
+                consulta = consulta.eq("atualizado_em", versao)
+            rows = consulta.execute().data
+            if not rows and versao is not None and local_do_usuario(local_id):
+                return jsonify(erro="registro mudou desde a última sincronização"), 409
             return (jsonify(mensagem="local excluído"), 200) if rows else (jsonify(erro="local não encontrado"), 404)
+        except ValueError as e:
+            return jsonify(erro=str(e)), 400
         except Exception:
             return erro_interno("Erro ao excluir local")
 
@@ -442,7 +465,7 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
             for usuario in usuarios:
                 usuario_id = usuario["id"]
                 preferencias = prefs_do_usuario(usuario_id)
-                local_agora = instante.astimezone(ZoneInfo(preferencias["fuso_horario"]))
+                local_agora = instante.astimezone(ZoneInfo(preferencias["fuso_horario"])).replace(tzinfo=None)
                 dispositivos = (supabase.table("dispositivos").select("fcm_token")
                                 .eq("usuario_id", usuario_id).execute().data)
                 if not dispositivos:
@@ -455,53 +478,58 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
                     if not preferencias[ligado]:
                         continue
                     antecedencia = int(preferencias[minutos])
-                    de = (local_agora + timedelta(minutes=antecedencia)).replace(tzinfo=None)
-                    ate = (local_agora + timedelta(minutes=antecedencia + 15)).replace(tzinfo=None)
+                    alvo = local_agora + timedelta(minutes=antecedencia)
+                    # Reconsidera lembretes atrasados enquanto o compromisso ainda é futuro.
+                    de = max(local_agora, alvo - TOLERANCIA_LEMBRETES)
+                    ate = alvo + INTERVALO_LEMBRETES
                     consulta = (supabase.table(tabela)
                                 .select(f"id,materia_id,{coluna},materias!inner(usuario_id,nome)")
                                 .eq("materias.usuario_id", usuario_id)
-                                .gte(coluna, de.isoformat()).lte(coluna, ate.isoformat()))
+                                 .gte(coluna, de.isoformat()).lt(coluna, ate.isoformat()))
                     if tipo == "tarefa":
                         consulta = consulta.eq("status", "pendente")
                     for evento in consulta.execute().data:
                         instante_evento = _hora_naive(evento[coluna])
-                        minutos_ate = (instante_evento - local_agora.replace(tzinfo=None)).total_seconds() / 60
-                        if not antecedencia <= minutos_ate < antecedencia + 15:
-                            continue
                         candidatos.append((tipo, evento["id"], f"{evento[coluna]}:{antecedencia}",
                             f"{'Tarefa' if tipo == 'tarefa' else 'Prova'} de {evento['materias']['nome']}",
-                            f"Faltam cerca de {antecedencia // 60} horas para o prazo."))
+                            f"Prazo em {instante_evento:%d/%m às %H:%M}."))
                 hora_estudo = preferencias.get("hora_lembrete_estudo")
                 if preferencias["notif_lembrete_estudo"] and hora_estudo:
-                    h, m = map(int, hora_estudo[:5].split(":"))
-                    horario = local_agora.replace(hour=h, minute=m, second=0, microsecond=0)
-                    decorrido = (local_agora - horario).total_seconds() / 60
-                    if 0 <= decorrido < 15:
-                        candidatos.append(("estudo", 0, f"{local_agora.date()}:{hora_estudo}",
+                    horario = datetime.combine(local_agora.date(), time.fromisoformat(hora_estudo))
+                    if horario > local_agora:
+                        horario -= timedelta(days=1)
+                    if local_agora - horario < TOLERANCIA_LEMBRETES:
+                        candidatos.append(("estudo", 0, f"{horario.date()}:{hora_estudo}",
                                            "Hora de estudar", "Reserve um momento para revisar suas matérias."))
                 for tipo, ref_id, janela, titulo, corpo in candidatos:
                     resultados["candidatos"] += 1
-                    claim = supabase.rpc("reservar_notificacao", {
+                    reservado_em = datetime.now(timezone.utc).isoformat()
+                    reserva_id = supabase.rpc("reservar_notificacao", {
                         "p_usuario_id": usuario_id, "p_tipo": tipo,
                         "p_referencia_id": ref_id, "p_janela": janela,
+                        "p_reservado_em": reservado_em,
                     }).execute().data
-                    if claim is None:
+                    if reserva_id is None:
                         resultados["ignorados"] += 1
                         continue
                     sucesso = 0
                     for dispositivo in dispositivos:
                         try:
                             ok, _ = enviar_push(dispositivo["fcm_token"], titulo, corpo,
-                                                {"tipo": tipo, "referencia_id": str(ref_id)})
+                                                {"tipo": tipo, "referencia_id": str(ref_id)},
+                                                usuario_id=usuario_id)
                             if ok:
                                 sucesso += 1
                         except Exception:
                             app.logger.exception("Erro no envio de push")
                     status = "enviado" if sucesso else "falha"
-                    atualizacao = {"status": status, "atualizado_em": instante.isoformat()}
+                    finalizado_em = datetime.now(timezone.utc).isoformat()
+                    atualizacao = {"status": status, "atualizado_em": finalizado_em}
                     if sucesso:
-                        atualizacao["enviado_em"] = instante.isoformat()
-                    supabase.table("notificacoes_processadas").update(atualizacao).eq("id", claim).execute()
+                        atualizacao["enviado_em"] = finalizado_em
+                    (supabase.table("notificacoes_processadas").update(atualizacao)
+                     .eq("id", reserva_id).eq("atualizado_em", reservado_em).eq("status", "processando")
+                     .execute())
                     resultados["enviados" if sucesso else "falhas"] += 1
             return jsonify(**resultados), 200
         except Exception:

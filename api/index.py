@@ -11,6 +11,7 @@ from flask import Flask, request, jsonify, g
 import bcrypt
 import jwt
 from supabase import create_client, Client
+from api.sincronizacao import criar_com_chave, versao_informada
 
 app = Flask(__name__)
 
@@ -302,10 +303,18 @@ def atualizar(tabela, registro_id, dados, permitidos, chave, com_timestamp=True)
     if com_timestamp:
         campos["atualizado_em"] = agora()
     try:
-        resp = supabase.table(tabela).update(campos).eq("id", registro_id).execute()
+        versao = versao_informada(request)
+        consulta = supabase.table(tabela).update(campos).eq("id", registro_id)
+        if versao is not None:
+            consulta = consulta.eq("atualizado_em", versao)
+        resp = consulta.execute()
         if not resp.data:
+            if versao is not None:
+                return jsonify(erro="registro mudou desde a última sincronização"), 409
             return jsonify(erro="registro não encontrado"), 404
         return jsonify({chave: resp.data[0]}), 200
+    except ValueError as e:
+        return jsonify(erro=str(e)), 400
     except Exception as e:
         return erro_banco(e)
 
@@ -316,10 +325,18 @@ def apagar(tabela, registro_id):
     if negado:
         return negado
     try:
-        resp = supabase.table(tabela).delete().eq("id", registro_id).execute()
+        versao = versao_informada(request)
+        consulta = supabase.table(tabela).delete().eq("id", registro_id)
+        if versao is not None:
+            consulta = consulta.eq("atualizado_em", versao)
+        resp = consulta.execute()
         if not resp.data:
+            if versao is not None:
+                return jsonify(erro="registro mudou desde a última sincronização"), 409
             return jsonify(erro="registro não encontrado"), 404
         return jsonify(mensagem="apagado com sucesso"), 200
+    except ValueError as e:
+        return jsonify(erro=str(e)), 400
     except Exception as e:
         return erro_banco(e)
 
@@ -329,7 +346,7 @@ def liberar_cors(response):
     # Libera chamadas do front web em outra origem. Flutter nativo não depende de CORS.
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Idempotency-Key, X-Registro-Versao"
     return response
 
 
@@ -521,18 +538,15 @@ def criar_materia():
     except ValueError as e:
         return jsonify(erro=str(e)), 400
 
+    campos = {"usuario_id": usuario_id, "nome": nome, "professor": dados.get("professor"), "cor": cor}
     materia = None
     try:
-        resp = (
-            supabase.table("materias")
-            .insert({
-                "usuario_id": usuario_id,
-                "nome": nome,
-                "professor": dados.get("professor"),
-                "cor": cor,
-            })
-            .execute()
+        offline = criar_com_chave(
+            supabase, request, jsonify, usuario_id, "materias", campos, "materia", horarios=horarios,
         )
+        if offline is not None:
+            return offline
+        resp = supabase.table("materias").insert(campos).execute()
         materia = resp.data[0]
 
         if horarios:
@@ -567,8 +581,20 @@ def apagar_materia(materia_id):
     if negado:
         return negado
     try:
+        versao = versao_informada(request)
+        if versao is not None:
+            status = supabase.rpc("excluir_materia_versionada", {
+                "p_usuario_id": _usuario_logado(), "p_materia_id": materia_id, "p_versao": versao,
+            }).execute().data
+            if status == 409:
+                return jsonify(erro="registro mudou desde a última sincronização"), 409
+            if status == 404:
+                return jsonify(erro="registro não encontrado"), 404
+            return jsonify(mensagem="apagado com sucesso"), 200
         for tabela in ("horarios_aula", "tarefas", "exames"):
             supabase.table(tabela).delete().eq("materia_id", materia_id).execute()
+    except ValueError as e:
+        return jsonify(erro=str(e)), 400
     except Exception as e:
         return erro_banco(e)
     return apagar("materias", materia_id)
@@ -584,17 +610,17 @@ def criar_horario(materia_id):
         validar_horario_iso(dados, obrigatorio=True)
     except ValueError as e:
         return jsonify(erro=str(e)), 400
+    campos = {
+        "materia_id": materia_id, "dia_semana": dados["dia_semana"],
+        "hora_inicio": dados["hora_inicio"], "hora_fim": dados["hora_fim"],
+    }
     try:
-        resp = (
-            supabase.table("horarios_aula")
-            .insert({
-                "materia_id": materia_id,
-                "dia_semana": dados["dia_semana"],
-                "hora_inicio": dados["hora_inicio"],
-                "hora_fim": dados["hora_fim"],
-            })
-            .execute()
+        offline = criar_com_chave(
+            supabase, request, jsonify, _usuario_logado(), "horarios_aula", campos, "horario",
         )
+        if offline is not None:
+            return offline
+        resp = supabase.table("horarios_aula").insert(campos).execute()
         return jsonify(horario=resp.data[0]), 201
     except Exception as e:
         return erro_banco(e)
@@ -669,6 +695,9 @@ def criar_tarefa():
         novo["status"] = dados["status"]  # Sem status informado, o banco usa "pendente".
 
     try:
+        offline = criar_com_chave(supabase, request, jsonify, _usuario_logado(), "tarefas", novo, "tarefa")
+        if offline is not None:
+            return offline
         resp = supabase.table("tarefas").insert(novo).execute()
         return jsonify(tarefa=resp.data[0]), 201
     except Exception as e:
@@ -732,16 +761,12 @@ def criar_exame():
     if negado:
         return negado
 
+    campos = {"materia_id": materia_id, "data_hora": data_hora, "descricao": dados.get("descricao")}
     try:
-        resp = (
-            supabase.table("exames")
-            .insert({
-                "materia_id": materia_id,
-                "data_hora": data_hora,
-                "descricao": dados.get("descricao"),
-            })
-            .execute()
-        )
+        offline = criar_com_chave(supabase, request, jsonify, _usuario_logado(), "exames", campos, "exame")
+        if offline is not None:
+            return offline
+        resp = supabase.table("exames").insert(campos).execute()
         return jsonify(exame=resp.data[0]), 201
     except Exception as e:
         return erro_banco(e)
@@ -783,7 +808,7 @@ def _credenciais_fcm():
     return _fcm_creds
 
 
-def enviar_push(fcm_token, titulo, corpo, dados=None):
+def enviar_push(fcm_token, titulo, corpo, dados=None, *, usuario_id):
     """Envia o push para um dispositivo e informa se deu certo."""
     import requests
 
@@ -804,7 +829,8 @@ def enviar_push(fcm_token, titulo, corpo, dados=None):
 
     # Remove tokens inválidos para não continuar tentando enviar ao mesmo aparelho.
     if r.status_code == 404 and "UNREGISTERED" in r.text:
-        supabase.table("dispositivos").delete().eq("fcm_token", fcm_token).eq("usuario_id", _usuario_logado()).execute()
+        (supabase.table("dispositivos").delete().eq("fcm_token", fcm_token)
+         .eq("usuario_id", usuario_id).execute())
         return False, "aparelho não registrado (token removido)"
     return False, r.text
 
@@ -886,7 +912,10 @@ def enviar_notificacao():
         return jsonify(erro="esse usuário não tem nenhum aparelho registrado"), 404
 
     try:
-        resultados = [enviar_push(a["fcm_token"], titulo, corpo, dados.get("dados")) for a in aparelhos]
+        resultados = [
+            enviar_push(a["fcm_token"], titulo, corpo, dados.get("dados"), usuario_id=usuario_id)
+            for a in aparelhos
+        ]
     except Exception as e:
         return jsonify(erro=f"falha ao falar com o Firebase: {e}"), 502
 

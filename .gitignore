@@ -30,7 +30,9 @@ Thumbs.db
 *.txt
 !requirements.txt
 !README.md
-migrations/
+migrations/*
+!migrations/005_recuperar_lembretes.sql
+!migrations/006_escritas_offline.sql
 tests/
 VERIFICAR_APOS_MIGRACOES.sql
 
