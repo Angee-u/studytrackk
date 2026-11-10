@@ -83,7 +83,7 @@ def autenticar_requisicao():
 
     try:
         usuarios = (supabase.table("usuarios")
-                    .select("id, nome, email, senha_hash, criado_em, atualizado_em")
+                    .select("id, nome, email, senha_hash, plano, criado_em, atualizado_em")
                     .eq("id", usuario_id).execute().data)
         if not usuarios or not usuarios[0].get("senha_hash"):
             return jsonify(erro="usuário não encontrado ou desativado"), 401
@@ -146,6 +146,23 @@ def _exigir_propriedade(tabela, registro_id):
     return None
 
 
+# Monetização: plano Free (gratuito) e Premium (pago).
+# Esta API não integra um meio de pagamento real — as rotas /api/assinatura/*
+# simulam a troca de plano para fins de demonstração do projeto acadêmico.
+MATERIAS_LIMITE_FREE = 5
+
+
+def _usuario_premium():
+    return g.usuario.get("plano") == "premium"
+
+
+def exigir_premium(mensagem):
+    """Bloqueia a rota para contas no plano Free, com uma mensagem explicando o motivo."""
+    if not _usuario_premium():
+        return jsonify(erro=mensagem, plano_atual="free", plano_necessario="premium"), 402
+    return None
+
+
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     dados = request.get_json(silent=True) or {}
@@ -156,7 +173,7 @@ def login():
         return jsonify(erro="email e senha são obrigatórios"), 400
     try:
         usuarios = (supabase.table("usuarios")
-                    .select("id, nome, email, senha_hash, criado_em, atualizado_em")
+                    .select("id, nome, email, senha_hash, plano, criado_em, atualizado_em")
                     .eq("email", email).execute().data)
         usuario = usuarios[0] if usuarios else None
         # Verificamos um hash fictício para e-mails desconhecidos, reduzindo diferenças de tempo na resposta.
@@ -490,6 +507,60 @@ def apagar_usuario(usuario_id):
         return erro_banco(e)
 
 
+# Plano de assinatura (Free / Premium)
+@app.route("/api/assinatura", methods=["GET"])
+def consultar_assinatura():
+    """Mostra o plano atual e os limites/recursos que ele libera."""
+    premium = _usuario_premium()
+    return jsonify(
+        plano=g.usuario.get("plano", "free"),
+        premium_desde=g.usuario.get("premium_desde"),
+        limite_materias=None if premium else MATERIAS_LIMITE_FREE,
+        recursos_premium=[
+            "materias_ilimitadas", "localizacao_gps", "codigos_qr",
+            "lembrete_de_estudo", "antecedencia_personalizada",
+        ],
+    ), 200
+
+
+@app.route("/api/assinatura/upgrade", methods=["POST"])
+def assinar_premium():
+    """
+    Ativa o plano Premium na conta autenticada.
+    Não há integração com um meio de pagamento real: esta rota existe apenas
+    para demonstrar a monetização no projeto, sem cobrança de fato.
+    """
+    try:
+        resp = (
+            supabase.table("usuarios")
+            .update({"plano": "premium", "premium_desde": agora(), "atualizado_em": agora()})
+            .eq("id", _usuario_logado())
+            .execute()
+        )
+        if not resp.data:
+            return jsonify(erro="usuário não encontrado"), 404
+        return jsonify(mensagem="plano Premium ativado", usuario=_usuario_seguro(resp.data[0])), 200
+    except Exception as e:
+        return erro_banco(e)
+
+
+@app.route("/api/assinatura/cancelar", methods=["POST"])
+def cancelar_premium():
+    """Volta a conta para o plano Free (simulado; sem estorno real)."""
+    try:
+        resp = (
+            supabase.table("usuarios")
+            .update({"plano": "free", "atualizado_em": agora()})
+            .eq("id", _usuario_logado())
+            .execute()
+        )
+        if not resp.data:
+            return jsonify(erro="usuário não encontrado"), 404
+        return jsonify(mensagem="plano Free restaurado", usuario=_usuario_seguro(resp.data[0])), 200
+    except Exception as e:
+        return erro_banco(e)
+
+
 # Matérias e horários de aula
 @app.route("/api/materias", methods=["GET"])
 def listar_materias():
@@ -541,6 +612,15 @@ def criar_materia():
     campos = {"usuario_id": usuario_id, "nome": nome, "professor": dados.get("professor"), "cor": cor}
     materia = None
     try:
+        if not _usuario_premium():
+            total = (supabase.table("materias").select("id", count="exact")
+                     .eq("usuario_id", usuario_id).execute())
+            if (total.count or 0) >= MATERIAS_LIMITE_FREE:
+                return jsonify(
+                    erro=f"o plano Free permite até {MATERIAS_LIMITE_FREE} matérias; "
+                         "assine o Premium para cadastrar mais",
+                    plano_atual="free", plano_necessario="premium",
+                ), 402
         offline = criar_com_chave(
             supabase, request, jsonify, usuario_id, "materias", campos, "materia", horarios=horarios,
         )
@@ -1102,4 +1182,6 @@ def consultar_progresso():
 
 # As rotas de GPS, QR Code e lembretes ficam em um módulo separado.
 from api.recursos import registrar_rotas_complementares
-registrar_rotas_complementares(app, supabase, g, request, jsonify, _exigir_propriedade, hash_senha, enviar_push)
+registrar_rotas_complementares(
+    app, supabase, g, request, jsonify, _exigir_propriedade, hash_senha, enviar_push, exigir_premium,
+)

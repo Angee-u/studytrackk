@@ -28,6 +28,12 @@ PREFERENCIAS_PADRAO = {
 INTERVALO_LEMBRETES = timedelta(minutes=15)
 TOLERANCIA_LEMBRETES = timedelta(hours=1)
 
+# Preferências que só o plano Premium pode personalizar; no Free elas ficam
+# travadas no padrão (antecedência fixa de 24h e sem lembrete de estudo).
+CAMPOS_PREMIUM_PREFERENCIAS = {
+    "antecedencia_tarefas_minutos", "antecedencia_exames_minutos", "hora_lembrete_estudo",
+}
+
 
 def _validar_preferencias(dados):
     permitidos = set(PREFERENCIAS_PADRAO)
@@ -95,7 +101,7 @@ def _distancia_metros(a_lat, a_lon, b_lat, b_lon):
     return round(2 * r * math.asin(min(1, math.sqrt(h))))
 
 
-def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_propriedade, hash_senha, enviar_push):
+def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_propriedade, hash_senha, enviar_push, exigir_premium):
     def erro_interno(msg):
         app.logger.exception(msg)
         return jsonify(erro="não foi possível concluir a operação"), 503
@@ -122,6 +128,13 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
             dados = _validar_preferencias(dados_json())
         except ValueError as e:
             return jsonify(erro=str(e)), 400
+        if CAMPOS_PREMIUM_PREFERENCIAS & set(dados):
+            negado = exigir_premium(
+                "personalizar a antecedência das notificações e o lembrete de estudo "
+                "é um recurso Premium"
+            )
+            if negado:
+                return negado
         try:
             anteriores = prefs_do_usuario(g.usuario_id)
             persistir = {campo: anteriores[campo] for campo in PREFERENCIAS_PADRAO}
@@ -135,6 +148,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/locais", methods=["GET"])
     def listar_locais():
+        negado = exigir_premium("lembretes por localização (GPS) são um recurso Premium")
+        if negado:
+            return negado
         try:
             rows = (supabase.table("locais").select("*")
                     .eq("usuario_id", g.usuario_id).execute().data)
@@ -166,6 +182,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/locais", methods=["POST"])
     def criar_local():
+        negado = exigir_premium("lembretes por localização (GPS) são um recurso Premium")
+        if negado:
+            return negado
         try:
             dados = validar_local(dados_json())
         except ValueError as e:
@@ -186,6 +205,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/locais/<int:local_id>", methods=["PUT"])
     def editar_local(local_id):
+        negado = exigir_premium("lembretes por localização (GPS) são um recurso Premium")
+        if negado:
+            return negado
         try:
             dados = validar_local(dados_json(), parcial=True)
         except ValueError as e:
@@ -211,6 +233,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/locais/<int:local_id>", methods=["DELETE"])
     def excluir_local(local_id):
+        negado = exigir_premium("lembretes por localização (GPS) são um recurso Premium")
+        if negado:
+            return negado
         try:
             versao = versao_informada(request)
             consulta = supabase.table("locais").delete().eq("id", local_id).eq("usuario_id", g.usuario_id)
@@ -253,6 +278,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/gps/chegada", methods=["POST"])
     def verificar_chegada():
+        negado = exigir_premium("lembretes por localização (GPS) são um recurso Premium")
+        if negado:
+            return negado
         dados = dados_json()
         try:
             local_id = int(dados["local_id"])
@@ -280,6 +308,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/qrcodes", methods=["GET"])
     def listar_qrcodes():
+        negado = exigir_premium("códigos QR são um recurso Premium")
+        if negado:
+            return negado
         try:
             itens = (supabase.table("codigos_qr")
                      .select("*,materias!inner(usuario_id)")
@@ -290,6 +321,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/qrcodes", methods=["POST"])
     def criar_qrcode():
+        negado = exigir_premium("códigos QR são um recurso Premium")
+        if negado:
+            return negado
         dados = dados_json()
         try:
             materia_id = int(dados["materia_id"])
@@ -334,6 +368,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/qrcodes/<string:codigo>", methods=["GET"])
     def resolver_qrcode(codigo):
+        negado = exigir_premium("códigos QR são um recurso Premium")
+        if negado:
+            return negado
         if len(codigo) > 128:
             return jsonify(erro="código inválido"), 400
         try:
@@ -356,6 +393,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/qrcodes/<string:codigo>/registrar", methods=["POST"])
     def registrar_leitura_qr(codigo):
+        negado = exigir_premium("códigos QR são um recurso Premium")
+        if negado:
+            return negado
         if len(codigo) > 128:
             return jsonify(erro="código inválido"), 400
         try:
@@ -380,6 +420,9 @@ def registrar_rotas_complementares(app, supabase, g, request, jsonify, exigir_pr
 
     @app.route("/api/qrcodes/<int:codigo_id>", methods=["DELETE"])
     def apagar_qrcode(codigo_id):
+        negado = exigir_premium("códigos QR são um recurso Premium")
+        if negado:
+            return negado
         try:
             rows = (supabase.table("codigos_qr")
                     .select("id,materias!inner(usuario_id)").eq("id", codigo_id)
